@@ -1,0 +1,3 @@
+[submodule "DetailView"]
+	path = DetailView
+	url = https://github.com/JulFrey/DetailView.git

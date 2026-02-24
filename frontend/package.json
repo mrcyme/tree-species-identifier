@@ -1,0 +1,34 @@
+{
+  "name": "frontend",
+  "private": true,
+  "version": "0.0.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "vue-tsc -b && vite build",
+    "preview": "vite preview"
+  },
+  "dependencies": {
+    "@deck.gl/core": "^9.2.6",
+    "@deck.gl/geo-layers": "^9.2.6",
+    "@deck.gl/layers": "^9.2.6",
+    "@deck.gl/mapbox": "^9.2.6",
+    "@deck.gl/mesh-layers": "^9.2.6",
+    "@loaders.gl/core": "^4.3.4",
+    "@types/mapbox-gl": "^3.4.1",
+    "axios": "^1.13.4",
+    "geotiff": "^3.0.0",
+    "mapbox-gl": "^3.18.1",
+    "maplibre-gl": "^5.17.0",
+    "vue": "^3.5.24"
+  },
+  "devDependencies": {
+    "@types/node": "^24.10.1",
+    "@vitejs/plugin-vue": "^6.0.1",
+    "@vue/tsconfig": "^0.8.1",
+    "typescript": "~5.9.3",
+    "vite": "^7.2.4",
+    "vue-tsc": "^3.1.4"
+  },
+  "packageManager": "pnpm@10.22.0+sha512.bf049efe995b28f527fd2b41ae0474ce29186f7edcb3bf545087bd61fbbebb2bf75362d1307fda09c2d288e1e499787ac12d4fcb617a974718a6051f2eee741c"
+}

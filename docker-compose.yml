@@ -1,0 +1,23 @@
+version: '3.8'
+
+services:
+  db:
+    image: postgis/postgis:16-3.4
+    container_name: tree-species-db
+    environment:
+      POSTGRES_USER: treeapp
+      POSTGRES_PASSWORD: treeapp_secret
+      POSTGRES_DB: trees
+    ports:
+      - "5433:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U treeapp -d trees"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+volumes:
+  postgres_data:
+
