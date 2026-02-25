@@ -283,6 +283,9 @@ async def process_las_file(
             ),
             n_points=pc_info.get("n_points"),
         )
+        # Required when we later open a new session for tree inserts:
+        # without commit, the point_cloud row may not be visible and FK checks fail.
+        await repo.commit()
         point_cloud_id = pc.id
 
     total_trees = 0
