@@ -142,6 +142,61 @@ async def point_cloud_exists(filename: str) -> bool:
         return result.first() is not None
 
 
+def _split_list(items: List[int], chunk_size: int) -> List[List[int]]:
+    return [items[i : i + chunk_size] for i in range(0, len(items), chunk_size)]
+
+
+def _write_treeid_subset_las(source_las: Path, tree_ids: List[int], out_las: Path) -> None:
+    las = laspy.read(str(source_las))
+    if "TreeID" not in las.point_format.dimension_names:
+        raise RuntimeError(f"TreeID not found in {source_las}")
+    mask = np.isin(np.array(las.TreeID), np.array(tree_ids, dtype=np.int64))
+    subset_points = las.points[mask]
+    if len(subset_points) == 0:
+        raise RuntimeError(f"No points in subset for {out_las}")
+    out_las.parent.mkdir(parents=True, exist_ok=True)
+    out_header = las.header.copy()
+    out_data = laspy.LasData(out_header)
+    out_data.points = subset_points
+    out_data.write(str(out_las))
+
+
+def run_species_prediction_chunked(
+    segmented_las: Path,
+    output_dir: Path,
+    n_aug: int,
+    max_trees_per_call: int,
+) -> List[dict]:
+    las = laspy.read(str(segmented_las))
+    tree_ids = sorted(int(t) for t in np.unique(np.array(las.TreeID)) if int(t) > 0)
+    if not tree_ids:
+        return []
+
+    if len(tree_ids) <= max_trees_per_call:
+        return run_species_prediction(segmented_las, output_dir, n_aug=n_aug)
+
+    logger.info(
+        "Large segmented chunk (%d trees). Running species prediction in batches of %d trees.",
+        len(tree_ids),
+        max_trees_per_call,
+    )
+    batches = _split_list(tree_ids, max_trees_per_call)
+    all_predictions: List[dict] = []
+    for idx, batch_ids in enumerate(batches, start=1):
+        batch_las = output_dir / f"species_batch_{idx:03d}.las"
+        batch_out = output_dir / f"species_batch_{idx:03d}_out"
+        _write_treeid_subset_las(segmented_las, batch_ids, batch_las)
+        preds = run_species_prediction(batch_las, batch_out, n_aug=n_aug)
+        all_predictions.extend(preds)
+        logger.info(
+            "Species batch %d/%d done (%d trees)",
+            idx,
+            len(batches),
+            len(batch_ids),
+        )
+    return all_predictions
+
+
 def _las_xy_bounds(las_path: Path) -> Tuple[float, float, float, float]:
     with laspy.open(str(las_path)) as fh:
         mins = fh.header.mins
@@ -251,6 +306,7 @@ async def process_las_file(
     enable_subtiling_fallback: bool,
     fallback_cell_size_m: float,
     fallback_overlap_m: float,
+    species_max_trees_per_call: int,
 ) -> dict:
     logger.info("Processing LAS: %s", las_path.name)
     job_dir = work_root / las_path.stem
@@ -312,8 +368,11 @@ async def process_las_file(
         total_trees += len(trees_for_db)
 
         # 4) species prediction + save
-        predictions = run_species_prediction(
-            chunk.segmented_las, job_dir / f"predictions_{chunk.label}", n_aug=n_aug
+        predictions = run_species_prediction_chunked(
+            segmented_las=chunk.segmented_las,
+            output_dir=job_dir / f"predictions_{chunk.label}",
+            n_aug=n_aug,
+            max_trees_per_call=species_max_trees_per_call,
         )
         async with async_session_maker() as session:
             repo = TreeRepository(session)
@@ -405,6 +464,7 @@ async def run_pipeline(args: argparse.Namespace) -> None:
                         enable_subtiling_fallback=args.enable_subtiling_fallback,
                         fallback_cell_size_m=args.fallback_cell_size_m,
                         fallback_overlap_m=args.fallback_overlap_m,
+                        species_max_trees_per_call=args.species_max_trees_per_call,
                     )
                     summaries.append(summary)
                     logger.info(
@@ -455,6 +515,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--tile-size-m", type=float, default=200.0, help="Global tileset tile size in meters.")
     parser.add_argument("--crs", default="31370", help="EPSG code of LAS input CRS.")
     parser.add_argument("--n-aug", type=int, default=3, help="Species prediction augmentations.")
+    parser.add_argument(
+        "--species-max-trees-per-call",
+        type=int,
+        default=300,
+        help="Max number of trees per species inference call (splits large chunks to reduce VRAM usage).",
+    )
     parser.add_argument("--max-faces", type=int, default=100, help="Max faces for generated shape meshes.")
     parser.add_argument(
         "--enable-subtiling-fallback",

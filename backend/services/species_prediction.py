@@ -5,6 +5,7 @@ import sys
 from pathlib import Path
 from typing import Dict, Any, List, Optional
 import logging
+import gc
 import pandas as pd
 import numpy as np
 
@@ -154,10 +155,22 @@ def run_species_prediction(
                     logger.error(f"CUDA failed after {max_retries} attempts: {error_msg}")
                     logger.info("Attempting CPU fallback...")
                     import os
-                    os.environ['CUDA_VISIBLE_DEVICES'] = ''
+                    os.environ["CUDA_VISIBLE_DEVICES"] = ""
                     cuda_available = False
+                    # Aggressively release GPU memory before CPU fallback.
+                    try:
+                        if torch.cuda.is_available():
+                            torch.cuda.empty_cache()
+                            torch.cuda.ipc_collect()
+                    except Exception:
+                        pass
+                    gc.collect()
                     # Try one more time with CPU
                     try:
+                        # Force run_predict() to select CPU device even when CUDA
+                        # remains visible to the current process.
+                        orig_is_available = torch.cuda.is_available
+                        torch.cuda.is_available = lambda: False
                         outfile, outfile_probs, joined_df, probs_df = run_predict(
                             prediction_data=str(segmented_las),
                             path_las="",
@@ -169,9 +182,14 @@ def run_species_prediction(
                             projection_backend="numpy",
                             output_type="csv"
                         )
+                        torch.cuda.is_available = orig_is_available
                         logger.info("CPU fallback successful")
                         break
                     except Exception as cpu_error:
+                        try:
+                            torch.cuda.is_available = orig_is_available
+                        except Exception:
+                            pass
                         logger.error(f"CPU fallback also failed: {cpu_error}")
                         raise RuntimeError(f"Species prediction failed on both CUDA and CPU: {cpu_error}")
             else:
