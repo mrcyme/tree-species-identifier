@@ -20,25 +20,28 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import json
 import logging
 import sys
 import math
 import zipfile
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
-from typing import List, Tuple
+from typing import Any, Dict, List, Tuple
 from urllib.parse import urlparse
 from urllib.request import urlopen
 import xml.etree.ElementTree as ET
 
 import laspy
 import numpy as np
+from sqlalchemy import select, func
 
 # Add backend root to path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from database import async_session_maker, init_db, close_db
-from database.models import PointCloud
+from database.models import PointCloud, Tree
 from database.repository import TreeRepository
 from services.segmentation import run_segmentation, get_point_cloud_info
 from services.shape_prediction import generate_tree_shape
@@ -72,6 +75,47 @@ class SegmentationChunk:
     trees: List[dict]
     individual_trees_dir: Path
     label: str
+
+
+def _utc_now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _load_progress(progress_path: Path) -> Dict[str, Any]:
+    if not progress_path.exists():
+        return {"version": 1, "updated_at": _utc_now_iso(), "entries": {}}
+    try:
+        data = json.loads(progress_path.read_text(encoding="utf-8"))
+        if not isinstance(data, dict):
+            raise ValueError("progress file root is not an object")
+        entries = data.get("entries", {})
+        if not isinstance(entries, dict):
+            entries = {}
+        data["entries"] = entries
+        data.setdefault("version", 1)
+        data.setdefault("updated_at", _utc_now_iso())
+        return data
+    except Exception as exc:
+        backup = progress_path.with_suffix(progress_path.suffix + ".corrupt")
+        progress_path.replace(backup)
+        logger.warning(
+            "Progress file was invalid and moved to %s (%s). Starting fresh.",
+            backup,
+            exc,
+        )
+        return {"version": 1, "updated_at": _utc_now_iso(), "entries": {}}
+
+
+def _save_progress(progress_path: Path, progress: Dict[str, Any]) -> None:
+    progress_path.parent.mkdir(parents=True, exist_ok=True)
+    progress["updated_at"] = _utc_now_iso()
+    tmp_path = progress_path.with_suffix(progress_path.suffix + ".tmp")
+    tmp_path.write_text(json.dumps(progress, indent=2, sort_keys=True), encoding="utf-8")
+    tmp_path.replace(progress_path)
+
+
+def _progress_key(source_filename: str, las_path: Path) -> str:
+    return f"{source_filename}::{las_path.name}"
 
 
 def parse_atom_feed(feed_url: str) -> List[FeedItem]:
@@ -140,6 +184,29 @@ async def point_cloud_exists(filename: str) -> bool:
             PointCloud.__table__.select().where(PointCloud.filename == filename).limit(1)
         )
         return result.first() is not None
+
+
+async def get_point_cloud_processing_status(filename: str) -> Tuple[bool, int | None, int]:
+    """
+    Check if a feed tile is already processed.
+
+    Returns:
+        (already_processed, point_cloud_id, tree_count)
+    """
+    async with async_session_maker() as session:
+        result = await session.execute(
+            select(PointCloud).where(PointCloud.filename == filename).order_by(PointCloud.created_at.desc())
+        )
+        point_cloud = result.scalars().first()
+        if point_cloud is None:
+            return False, None, 0
+
+        tree_count_result = await session.execute(
+            select(func.count(Tree.id)).where(Tree.point_cloud_id == point_cloud.id)
+        )
+        linked_tree_count = int(tree_count_result.scalar() or 0)
+        total_tree_count = max(int(point_cloud.n_trees or 0), linked_tree_count)
+        return total_tree_count > 0, int(point_cloud.id), total_tree_count
 
 
 def _split_list(items: List[int], chunk_size: int) -> List[List[int]]:
@@ -442,39 +509,105 @@ async def run_pipeline(args: argparse.Namespace) -> None:
         downloads_dir = Path(args.downloads_dir).resolve()
         work_dir = Path(args.work_dir).resolve()
         work_dir.mkdir(parents=True, exist_ok=True)
+        progress_path = Path(args.progress_file).resolve()
+        progress = _load_progress(progress_path)
+        entries: Dict[str, Dict[str, Any]] = progress["entries"]
+        logger.info("Using progress file: %s", progress_path)
 
         summaries = []
         for idx, item in enumerate(items, start=1):
             logger.info("[%d/%d] %s", idx, len(items), item.zip_name)
             try:
-                if args.skip_existing_db and await point_cloud_exists(item.zip_name):
+                already_processed, existing_pc_id, existing_tree_count = await get_point_cloud_processing_status(
+                    item.zip_name
+                )
+
+                if already_processed and not args.reprocess_existing:
+                    logger.info(
+                        "DB has existing trees for tile %s (point_cloud_id=%s, trees=%d). "
+                        "Will rely on per-LAS progress checkpoint for resume safety.",
+                        item.zip_name,
+                        existing_pc_id,
+                        existing_tree_count,
+                    )
+
+                # Legacy behavior (stricter): skip as soon as a point_cloud row exists.
+                if args.skip_existing_db and existing_pc_id is not None:
                     logger.info("Skipping already-ingested point cloud: %s", item.zip_name)
                     continue
 
                 zip_path = download_zip(item.url, downloads_dir / item.zip_name)
                 extracted = extract_las_files(zip_path, work_dir / "extracted" / zip_path.stem)
                 for las_path in extracted:
-                    summary = await process_las_file(
-                        las_path=las_path,
-                        source_filename=item.zip_name,
-                        work_root=work_dir / "processing",
-                        crs=args.crs,
-                        n_aug=args.n_aug,
-                        max_faces=args.max_faces,
-                        enable_subtiling_fallback=args.enable_subtiling_fallback,
-                        fallback_cell_size_m=args.fallback_cell_size_m,
-                        fallback_overlap_m=args.fallback_overlap_m,
-                        species_max_trees_per_call=args.species_max_trees_per_call,
-                    )
-                    summaries.append(summary)
-                    logger.info(
-                        "Processed %s: chunks=%d trees=%d species=%d shapes=%d",
-                        summary["source"],
-                        summary.get("n_chunks", 1),
-                        summary["n_trees"],
-                        summary["n_species"],
-                        summary["n_shapes"],
-                    )
+                    key = _progress_key(item.zip_name, las_path)
+                    existing_entry = entries.get(key, {})
+                    if (
+                        not args.reprocess_existing
+                        and isinstance(existing_entry, dict)
+                        and existing_entry.get("status") == "completed"
+                    ):
+                        logger.info("Skipping completed LAS from progress file: %s", key)
+                        continue
+
+                    attempts = int(existing_entry.get("attempts", 0)) + 1
+                    entries[key] = {
+                        **existing_entry,
+                        "source": item.zip_name,
+                        "las": las_path.name,
+                        "status": "in_progress",
+                        "attempts": attempts,
+                        "last_error": None,
+                        "updated_at": _utc_now_iso(),
+                    }
+                    _save_progress(progress_path, progress)
+
+                    try:
+                        summary = await process_las_file(
+                            las_path=las_path,
+                            source_filename=item.zip_name,
+                            work_root=work_dir / "processing",
+                            crs=args.crs,
+                            n_aug=args.n_aug,
+                            max_faces=args.max_faces,
+                            enable_subtiling_fallback=args.enable_subtiling_fallback,
+                            fallback_cell_size_m=args.fallback_cell_size_m,
+                            fallback_overlap_m=args.fallback_overlap_m,
+                            species_max_trees_per_call=args.species_max_trees_per_call,
+                        )
+                        summaries.append(summary)
+                        logger.info(
+                            "Processed %s: chunks=%d trees=%d species=%d shapes=%d",
+                            summary["source"],
+                            summary.get("n_chunks", 1),
+                            summary["n_trees"],
+                            summary["n_species"],
+                            summary["n_shapes"],
+                        )
+                        entries[key] = {
+                            **entries[key],
+                            "status": "completed",
+                            "completed_at": _utc_now_iso(),
+                            "last_error": None,
+                            "last_summary": {
+                                "n_chunks": summary.get("n_chunks", 1),
+                                "n_trees": summary.get("n_trees", 0),
+                                "n_species": summary.get("n_species", 0),
+                                "n_shapes": summary.get("n_shapes", 0),
+                            },
+                            "updated_at": _utc_now_iso(),
+                        }
+                        _save_progress(progress_path, progress)
+                    except Exception as exc:
+                        entries[key] = {
+                            **entries[key],
+                            "status": "failed",
+                            "last_error": str(exc),
+                            "updated_at": _utc_now_iso(),
+                        }
+                        _save_progress(progress_path, progress)
+                        logger.exception("Failed processing %s (%s): %s", item.zip_name, las_path.name, exc)
+                        if not args.continue_on_error:
+                            raise
             except Exception as exc:
                 logger.exception("Failed processing %s: %s", item.zip_name, exc)
                 if not args.continue_on_error:
@@ -544,12 +677,22 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--skip-existing-db",
         action="store_true",
-        help="Skip feed items already present in DB (by point_cloud filename).",
+        help="Legacy: skip feed items when a point_cloud row already exists (even if no trees yet).",
+    )
+    parser.add_argument(
+        "--reprocess-existing",
+        action="store_true",
+        help="Force reprocessing tiles even when trees already exist in DB.",
     )
     parser.add_argument(
         "--continue-on-error",
         action="store_true",
         help="Continue processing next files if one file fails.",
+    )
+    parser.add_argument(
+        "--progress-file",
+        default="../output/atom_feed_work/atom_feed_progress.json",
+        help="JSON file used to persist per-LAS progress checkpoints for robust resume.",
     )
     return parser
 

@@ -177,9 +177,11 @@ Run from `backend/`:
 python scripts/process_atom_feed_pointclouds.py \
   --feed-url "https://urbisdownload.datastore.brussels/atomfeed/ff1124e1-424e-11ee-b156-00090ffe0001-en.xml" \
   --tile-size-m 200 \
-  --skip-existing-db \
   --continue-on-error
 ```
+
+By default, the script skips tiles that are already processed in DB (same ZIP filename with existing trees), so it does not re-download or re-segment them.  
+Use `--reprocess-existing` to force processing again.
 
 Quick test on first tile only:
 
@@ -198,7 +200,8 @@ Key options:
 | `--tile-size-m` | Global 3D Tiles tile size (meters) | `200` |
 | `--crs` | Input LAS CRS EPSG code | `31370` |
 | `--limit` | Process only first N feed items | all |
-| `--skip-existing-db` | Skip items already present in DB by filename | off |
+| `--reprocess-existing` | Force processing even if trees already exist for the tile in DB | off |
+| `--skip-existing-db` | Legacy: skip when point_cloud row exists, even with 0 trees | off |
 | `--continue-on-error` | Continue when one tile fails | off |
 
 ### CLI Options
