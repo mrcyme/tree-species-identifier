@@ -66,10 +66,7 @@ Then open http://localhost:3000 in your browser.
 
 ### Prerequisites
 
-1. **R (≥ 4.0)** with packages:
-   ```r
-   install.packages(c("lidR", "terra", "data.table"))
-   ```
+1. **R (≥ 4.0)** for tree segmentation
 
 2. **Python (≥ 3.10)**
 
@@ -80,6 +77,24 @@ Then open http://localhost:3000 in your browser.
 
 4. **Mapbox Token** (optional, for satellite imagery):
    Get one at https://www.mapbox.com/
+
+### Install R Dependencies
+
+Install the R packages required by `src/segment_trees.R`:
+
+```bash
+# Linux / macOS
+Rscript -e 'install.packages(c("lidR","terra","data.table"), repos="https://cloud.r-project.org")'
+
+# Windows (PowerShell / CMD)
+Rscript -e "install.packages(c('lidR','terra','data.table'), repos='https://cloud.r-project.org')"
+```
+
+Optional quick check:
+
+```bash
+Rscript -e 'library(lidR); library(terra); library(data.table); cat("R deps OK\n")'
+```
 
 ### Backend Setup
 
@@ -143,6 +158,48 @@ python src/identify_species.py input_pointcloud.las \
   --subset 149500,170500,149700,170700 \
   --n-aug 10
 ```
+
+### Atom Feed Batch Pipeline
+
+Use `backend/scripts/process_atom_feed_pointclouds.py` to run the full workflow on all LAS ZIP links from an Atom feed:
+
+1. Parse Atom feed (`link rel="section"`)
+2. Download ZIP point-cloud tiles
+3. Extract LAS/LAZ files
+4. Run segmentation and save trees in DB
+5. Run species prediction and save species/confidence/probabilities in DB
+6. Run shape prediction and save `shape_mesh` in DB
+7. Generate global 3D Tiles from DB (default tile size: 200 m)
+
+Run from `backend/`:
+
+```bash
+python scripts/process_atom_feed_pointclouds.py \
+  --feed-url "https://urbisdownload.datastore.brussels/atomfeed/ff1124e1-424e-11ee-b156-00090ffe0001-en.xml" \
+  --tile-size-m 200 \
+  --skip-existing-db \
+  --continue-on-error
+```
+
+Quick test on first tile only:
+
+```bash
+python scripts/process_atom_feed_pointclouds.py --limit 1 --tile-size-m 200
+```
+
+Key options:
+
+| Option | Description | Default |
+|--------|-------------|---------|
+| `--feed-url` | Atom feed URL containing ZIP links | Brussels 2021 feed |
+| `--downloads-dir` | Directory for downloaded ZIP files | `../output/atom_feed_downloads` |
+| `--work-dir` | Directory for extracted and intermediate files | `../output/atom_feed_work` |
+| `--tiles-output` | Final 3D Tiles output directory | `../output/shape_gltf_tiles` |
+| `--tile-size-m` | Global 3D Tiles tile size (meters) | `200` |
+| `--crs` | Input LAS CRS EPSG code | `31370` |
+| `--limit` | Process only first N feed items | all |
+| `--skip-existing-db` | Skip items already present in DB by filename | off |
+| `--continue-on-error` | Continue when one tile fails | off |
 
 ### CLI Options
 

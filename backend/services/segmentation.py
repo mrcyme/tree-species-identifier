@@ -98,8 +98,15 @@ def run_segmentation(
         )
         
         if result.returncode != 0:
-            logger.error(f"Segmentation failed: {result.stderr}")
-            raise RuntimeError(f"Segmentation failed: {result.stderr}")
+            stderr_text = (result.stderr or "").strip()
+            stdout_text = (result.stdout or "").strip()
+            details = stderr_text or stdout_text
+            if details:
+                details = details[-2000:]
+            logger.error("Segmentation failed (exit code=%s): %s", result.returncode, details)
+            raise RuntimeError(
+                f"Segmentation failed (exit code={result.returncode}): {details}"
+            )
         
         logger.info(f"Segmentation output: {result.stdout[-500:]}")
         
@@ -158,7 +165,6 @@ def extract_tree_metrics(segmented_las: Path, output_dir: Path, crs: str = "3137
         # Convert center to WGS84
         center_x, center_y = float(x.mean()), float(y.mean())
         center_z = float(z_for_geo.mean())
-        print(center_z)
         lon, lat = transformer_xy.transform(center_x, center_y)
         if transformer_3d is not None:
             _, _, center_h_ellipsoid = transformer_3d.transform(center_x, center_y, center_z)

@@ -22,10 +22,11 @@ import argparse
 import asyncio
 import logging
 import sys
+import math
 import zipfile
 from dataclasses import dataclass
 from pathlib import Path
-from typing import List
+from typing import List, Tuple
 from urllib.parse import urlparse
 from urllib.request import urlopen
 import xml.etree.ElementTree as ET
@@ -63,6 +64,14 @@ class FeedItem:
     @property
     def zip_name(self) -> str:
         return Path(urlparse(self.url).path).name
+
+
+@dataclass
+class SegmentationChunk:
+    segmented_las: Path
+    trees: List[dict]
+    individual_trees_dir: Path
+    label: str
 
 
 def parse_atom_feed(feed_url: str) -> List[FeedItem]:
@@ -133,6 +142,105 @@ async def point_cloud_exists(filename: str) -> bool:
         return result.first() is not None
 
 
+def _las_xy_bounds(las_path: Path) -> Tuple[float, float, float, float]:
+    with laspy.open(str(las_path)) as fh:
+        mins = fh.header.mins
+        maxs = fh.header.maxs
+    return float(mins[0]), float(mins[1]), float(maxs[0]), float(maxs[1])
+
+
+def _build_subset_grid(
+    bounds: Tuple[float, float, float, float],
+    cell_size_m: float,
+    overlap_m: float,
+) -> List[Tuple[float, float, float, float]]:
+    min_x, min_y, max_x, max_y = bounds
+    if cell_size_m <= 0:
+        raise ValueError("cell_size_m must be > 0")
+    step = max(cell_size_m - overlap_m, cell_size_m * 0.5)
+    nx = max(1, math.ceil((max_x - min_x) / step))
+    ny = max(1, math.ceil((max_y - min_y) / step))
+
+    subsets: List[Tuple[float, float, float, float]] = []
+    for ix in range(nx):
+        for iy in range(ny):
+            sx0 = min_x + ix * step
+            sy0 = min_y + iy * step
+            sx1 = min(max_x, sx0 + cell_size_m)
+            sy1 = min(max_y, sy0 + cell_size_m)
+            subsets.append((sx0, sy0, sx1, sy1))
+    return subsets
+
+
+def _subset_to_arg(subset: Tuple[float, float, float, float]) -> str:
+    return ",".join(f"{v:.3f}" for v in subset)
+
+
+def run_segmentation_with_fallback(
+    las_path: Path,
+    job_dir: Path,
+    crs: str,
+    enable_subtiling_fallback: bool,
+    fallback_cell_size_m: float,
+    fallback_overlap_m: float,
+) -> List[SegmentationChunk]:
+    try:
+        seg = run_segmentation(las_path, job_dir, crs=crs)
+        return [
+            SegmentationChunk(
+                segmented_las=Path(seg["segmented_las"]),
+                trees=seg["trees"],
+                individual_trees_dir=Path(seg["individual_trees_dir"]),
+                label="full",
+            )
+        ]
+    except Exception as exc:
+        if not enable_subtiling_fallback:
+            raise
+        logger.warning(
+            "Full-tile segmentation failed for %s. Retrying with spatial chunks: %s",
+            las_path.name,
+            exc,
+        )
+
+    bounds = _las_xy_bounds(las_path)
+    subsets = _build_subset_grid(bounds, fallback_cell_size_m, fallback_overlap_m)
+    logger.info(
+        "Sub-tiling fallback for %s: %d chunks (size=%sm overlap=%sm)",
+        las_path.name,
+        len(subsets),
+        fallback_cell_size_m,
+        fallback_overlap_m,
+    )
+
+    chunks: List[SegmentationChunk] = []
+    for idx, subset in enumerate(subsets, start=1):
+        subset_label = f"chunk_{idx:03d}"
+        subset_dir = job_dir / subset_label
+        subset_arg = _subset_to_arg(subset)
+        try:
+            seg = run_segmentation(las_path, subset_dir, crs=crs, subset=subset_arg)
+            if not seg["trees"]:
+                continue
+            chunks.append(
+                SegmentationChunk(
+                    segmented_las=Path(seg["segmented_las"]),
+                    trees=seg["trees"],
+                    individual_trees_dir=Path(seg["individual_trees_dir"]),
+                    label=subset_label,
+                )
+            )
+            logger.info("%s succeeded with %d trees", subset_label, len(seg["trees"]))
+        except Exception as exc:
+            logger.warning("%s failed (%s): %s", subset_label, subset_arg, exc)
+
+    if not chunks:
+        raise RuntimeError(
+            f"Segmentation failed for {las_path.name} both full-tile and all sub-tiles."
+        )
+    return chunks
+
+
 async def process_las_file(
     las_path: Path,
     source_filename: str,
@@ -140,19 +248,26 @@ async def process_las_file(
     crs: str,
     n_aug: int,
     max_faces: int,
+    enable_subtiling_fallback: bool,
+    fallback_cell_size_m: float,
+    fallback_overlap_m: float,
 ) -> dict:
     logger.info("Processing LAS: %s", las_path.name)
     job_dir = work_root / las_path.stem
     job_dir.mkdir(parents=True, exist_ok=True)
 
-    # 1) segmentation + metrics
-    seg_result = run_segmentation(las_path, job_dir, crs=crs)
-    segmented_las = Path(seg_result["segmented_las"])
+    # 1) segmentation (+ fallback chunking if needed)
+    seg_chunks = run_segmentation_with_fallback(
+        las_path=las_path,
+        job_dir=job_dir,
+        crs=crs,
+        enable_subtiling_fallback=enable_subtiling_fallback,
+        fallback_cell_size_m=fallback_cell_size_m,
+        fallback_overlap_m=fallback_overlap_m,
+    )
     pc_info = get_point_cloud_info(las_path, crs=crs)
 
-    # 2) save trees in DB
-    tree_db_ids: dict[int, int] = {}
-    point_cloud_id: int | None = None
+    # 2) ensure point cloud exists in DB
     async with async_session_maker() as session:
         repo = TreeRepository(session)
         pc = await repo.get_or_create_point_cloud(
@@ -170,62 +285,88 @@ async def process_las_file(
         )
         point_cloud_id = pc.id
 
-        individual_dir = job_dir / "individual_trees"
-        for tree_data in seg_result["trees"]:
-            tree_data["point_cloud_path"] = str(individual_dir / f"tree_{tree_data['tree_id']}.las")
+    total_trees = 0
+    total_species = 0
+    total_shapes = 0
 
-        db_trees = await repo.bulk_upsert_trees(point_cloud_id, seg_result["trees"])
-        pc.n_trees = len(db_trees)
-        tree_db_ids = {t.tree_id: t.id for t in db_trees}
-        await repo.commit()
-
-    # 3) species prediction + save
-    predictions = run_species_prediction(segmented_las, job_dir / "predictions", n_aug=n_aug)
-    async with async_session_maker() as session:
-        repo = TreeRepository(session)
-        for pred in predictions:
-            await repo.update_species_prediction(
-                tree_id=pred["tree_id"],
-                point_cloud_id=point_cloud_id,
-                species_id=pred["species_id"],
-                species_name=pred["species_name"],
-                confidence=pred["confidence"],
-                probabilities=pred.get("probabilities"),
+    for chunk in seg_chunks:
+        # 3) save chunk trees in DB
+        tree_db_ids: dict[int, int] = {}
+        trees_for_db = [dict(t) for t in chunk.trees]
+        for tree_data in trees_for_db:
+            tree_data["point_cloud_path"] = str(
+                chunk.individual_trees_dir / f"tree_{tree_data['tree_id']}.las"
             )
-        await repo.commit()
 
-    # 4) shape prediction + save
-    shape_saved = 0
-    individual_dir = job_dir / "individual_trees"
-    async with async_session_maker() as session:
-        repo = TreeRepository(session)
-        for tree in seg_result["trees"]:
-            tree_id = tree["tree_id"]
-            db_id = tree_db_ids.get(tree_id)
-            if not db_id:
-                continue
-            tree_las_path = individual_dir / f"tree_{tree_id}.las"
-            if not tree_las_path.exists():
-                continue
-            try:
-                las = laspy.read(str(tree_las_path))
-                x, y, z = np.array(las.x), np.array(las.y), np.array(las.z)
-                if len(x) < 10:
+        async with async_session_maker() as session:
+            repo = TreeRepository(session)
+            db_trees = await repo.bulk_upsert_trees(point_cloud_id, trees_for_db)
+            # Map input tree_id -> DB id by position, resilient to location-based dedup updates.
+            for in_tree, db_tree in zip(trees_for_db, db_trees):
+                tree_db_ids[int(in_tree["tree_id"])] = int(db_tree.id)
+            await repo.commit()
+
+        total_trees += len(trees_for_db)
+
+        # 4) species prediction + save
+        predictions = run_species_prediction(
+            chunk.segmented_las, job_dir / f"predictions_{chunk.label}", n_aug=n_aug
+        )
+        async with async_session_maker() as session:
+            repo = TreeRepository(session)
+            for pred in predictions:
+                db_id = tree_db_ids.get(int(pred["tree_id"]))
+                if not db_id:
                     continue
-                local_points = np.column_stack([x - x.mean(), y - y.mean(), z - z.mean()])
-                shape_mesh = generate_tree_shape(local_points, max_faces=max_faces)
-                await repo.update_shape_prediction(db_id=db_id, shape_mesh=shape_mesh)
-                shape_saved += 1
-            except Exception as exc:
-                logger.warning("Shape prediction failed for tree %s (%s): %s", tree_id, las_path.name, exc)
-        await repo.commit()
+                await repo.update_species_by_db_id(
+                    db_id=db_id,
+                    species_id=pred["species_id"],
+                    species_name=pred["species_name"],
+                    confidence=pred["confidence"],
+                    probabilities=pred.get("probabilities"),
+                )
+            await repo.commit()
+        total_species += len(predictions)
+
+        # 5) shape prediction + save
+        chunk_shapes = 0
+        async with async_session_maker() as session:
+            repo = TreeRepository(session)
+            for tree in trees_for_db:
+                tree_id = int(tree["tree_id"])
+                db_id = tree_db_ids.get(tree_id)
+                if not db_id:
+                    continue
+                tree_las_path = chunk.individual_trees_dir / f"tree_{tree_id}.las"
+                if not tree_las_path.exists():
+                    continue
+                try:
+                    las = laspy.read(str(tree_las_path))
+                    x, y, z = np.array(las.x), np.array(las.y), np.array(las.z)
+                    if len(x) < 10:
+                        continue
+                    local_points = np.column_stack([x - x.mean(), y - y.mean(), z - z.mean()])
+                    shape_mesh = generate_tree_shape(local_points, max_faces=max_faces)
+                    await repo.update_shape_prediction(db_id=db_id, shape_mesh=shape_mesh)
+                    chunk_shapes += 1
+                except Exception as exc:
+                    logger.warning(
+                        "Shape prediction failed for tree %s (%s, %s): %s",
+                        tree_id,
+                        las_path.name,
+                        chunk.label,
+                        exc,
+                    )
+            await repo.commit()
+        total_shapes += chunk_shapes
 
     return {
         "source": source_filename,
         "point_cloud_id": point_cloud_id,
-        "n_trees": len(seg_result["trees"]),
-        "n_species": len(predictions),
-        "n_shapes": shape_saved,
+        "n_trees": total_trees,
+        "n_species": total_species,
+        "n_shapes": total_shapes,
+        "n_chunks": len(seg_chunks),
     }
 
 
@@ -258,11 +399,15 @@ async def run_pipeline(args: argparse.Namespace) -> None:
                         crs=args.crs,
                         n_aug=args.n_aug,
                         max_faces=args.max_faces,
+                        enable_subtiling_fallback=args.enable_subtiling_fallback,
+                        fallback_cell_size_m=args.fallback_cell_size_m,
+                        fallback_overlap_m=args.fallback_overlap_m,
                     )
                     summaries.append(summary)
                     logger.info(
-                        "Processed %s: trees=%d species=%d shapes=%d",
+                        "Processed %s: chunks=%d trees=%d species=%d shapes=%d",
                         summary["source"],
+                        summary.get("n_chunks", 1),
                         summary["n_trees"],
                         summary["n_species"],
                         summary["n_shapes"],
@@ -308,6 +453,24 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--crs", default="31370", help="EPSG code of LAS input CRS.")
     parser.add_argument("--n-aug", type=int, default=3, help="Species prediction augmentations.")
     parser.add_argument("--max-faces", type=int, default=100, help="Max faces for generated shape meshes.")
+    parser.add_argument(
+        "--enable-subtiling-fallback",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="If full-tile segmentation fails, retry using spatial sub-tiles.",
+    )
+    parser.add_argument(
+        "--fallback-cell-size-m",
+        type=float,
+        default=700.0,
+        help="Sub-tile size (meters) used for segmentation fallback.",
+    )
+    parser.add_argument(
+        "--fallback-overlap-m",
+        type=float,
+        default=15.0,
+        help="Overlap (meters) between fallback sub-tiles.",
+    )
     parser.add_argument("--limit", type=int, default=None, help="Process only first N feed ZIP entries.")
     parser.add_argument(
         "--skip-existing-db",
