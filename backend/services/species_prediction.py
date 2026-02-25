@@ -139,7 +139,8 @@ def run_species_prediction(
                 output_dir=str(output_dir),
                 path_csv_lookup=str(DETAILVIEW_DIR / "lookup.csv"),
                 projection_backend="numpy",
-                output_type="csv"
+                output_type="csv",
+                force_device="cuda" if cuda_available else "cpu",
             )
             break  # Success, exit retry loop
             
@@ -167,10 +168,6 @@ def run_species_prediction(
                     gc.collect()
                     # Try one more time with CPU
                     try:
-                        # Force run_predict() to select CPU device even when CUDA
-                        # remains visible to the current process.
-                        orig_is_available = torch.cuda.is_available
-                        torch.cuda.is_available = lambda: False
                         outfile, outfile_probs, joined_df, probs_df = run_predict(
                             prediction_data=str(segmented_las),
                             path_las="",
@@ -180,16 +177,12 @@ def run_species_prediction(
                             output_dir=str(output_dir),
                             path_csv_lookup=str(DETAILVIEW_DIR / "lookup.csv"),
                             projection_backend="numpy",
-                            output_type="csv"
+                            output_type="csv",
+                            force_device="cpu",
                         )
-                        torch.cuda.is_available = orig_is_available
                         logger.info("CPU fallback successful")
                         break
                     except Exception as cpu_error:
-                        try:
-                            torch.cuda.is_available = orig_is_available
-                        except Exception:
-                            pass
                         logger.error(f"CPU fallback also failed: {cpu_error}")
                         raise RuntimeError(f"Species prediction failed on both CUDA and CPU: {cpu_error}")
             else:
