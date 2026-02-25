@@ -2,6 +2,7 @@
 Species prediction service using DetailView
 """
 import sys
+import inspect
 from pathlib import Path
 from typing import Dict, Any, List, Optional
 import logging
@@ -120,6 +121,7 @@ def run_species_prediction(
     retry_delay = 2  # seconds
     joined_df = None
     probs_df = None
+    supports_force_device = "force_device" in inspect.signature(run_predict).parameters
     
     for attempt in range(max_retries):
         try:
@@ -130,7 +132,7 @@ def run_species_prediction(
                 time.sleep(retry_delay)
                 logger.info(f"Retry attempt {attempt + 1}/{max_retries}")
             
-            outfile, outfile_probs, joined_df, probs_df = run_predict(
+            predict_kwargs = dict(
                 prediction_data=str(segmented_las),
                 path_las="",
                 model_path=str(model_path),
@@ -140,8 +142,10 @@ def run_species_prediction(
                 path_csv_lookup=str(DETAILVIEW_DIR / "lookup.csv"),
                 projection_backend="numpy",
                 output_type="csv",
-                force_device="cuda" if cuda_available else "cpu",
             )
+            if supports_force_device:
+                predict_kwargs["force_device"] = "cuda" if cuda_available else "cpu"
+            outfile, outfile_probs, joined_df, probs_df = run_predict(**predict_kwargs)
             break  # Success, exit retry loop
             
         except RuntimeError as e:
@@ -168,7 +172,7 @@ def run_species_prediction(
                     gc.collect()
                     # Try one more time with CPU
                     try:
-                        outfile, outfile_probs, joined_df, probs_df = run_predict(
+                        predict_kwargs = dict(
                             prediction_data=str(segmented_las),
                             path_las="",
                             model_path=str(model_path),
@@ -178,8 +182,19 @@ def run_species_prediction(
                             path_csv_lookup=str(DETAILVIEW_DIR / "lookup.csv"),
                             projection_backend="numpy",
                             output_type="csv",
-                            force_device="cpu",
                         )
+                        if supports_force_device:
+                            predict_kwargs["force_device"] = "cpu"
+                            outfile, outfile_probs, joined_df, probs_df = run_predict(**predict_kwargs)
+                        else:
+                            # Backward compatibility for older DetailView/predict.py without force_device.
+                            # We temporarily force torch to report CUDA unavailable for this call.
+                            original_is_available = torch.cuda.is_available
+                            torch.cuda.is_available = lambda: False
+                            try:
+                                outfile, outfile_probs, joined_df, probs_df = run_predict(**predict_kwargs)
+                            finally:
+                                torch.cuda.is_available = original_is_available
                         logger.info("CPU fallback successful")
                         break
                     except Exception as cpu_error:
