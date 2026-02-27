@@ -3,7 +3,7 @@ Database repository for tree operations
 """
 import logging
 from typing import List, Optional, Tuple
-from sqlalchemy import select, func, and_
+from sqlalchemy import select, func, and_, case
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.dialects.postgresql import insert
 
@@ -60,18 +60,51 @@ class TreeRepository:
         self,
         longitude: float,
         latitude: float,
-        tolerance: float = LOCATION_TOLERANCE
+        tolerance: float = LOCATION_TOLERANCE,
+        preferred_point_cloud_id: Optional[int] = None,
     ) -> Optional[Tree]:
-        """Find existing tree near the given location"""
-        result = await self.session.execute(
-            select(Tree).where(
-                and_(
-                    func.abs(Tree.longitude - longitude) < tolerance,
-                    func.abs(Tree.latitude - latitude) < tolerance
-                )
+        """
+        Find one existing tree near the given location.
+
+        This intentionally returns the best match (first row) instead of
+        expecting uniqueness, because historical data can contain duplicate
+        rows at near-identical coordinates.
+        """
+        query = select(Tree).where(
+            and_(
+                func.abs(Tree.longitude - longitude) < tolerance,
+                func.abs(Tree.latitude - latitude) < tolerance,
             )
         )
-        return result.scalar_one_or_none()
+        if preferred_point_cloud_id is not None:
+            query = query.order_by(
+                case((Tree.point_cloud_id == preferred_point_cloud_id, 0), else_=1),
+                Tree.updated_at.desc(),
+                Tree.id.desc(),
+            )
+        else:
+            query = query.order_by(Tree.updated_at.desc(), Tree.id.desc())
+        result = await self.session.execute(query.limit(1))
+        return result.scalars().first()
+
+    async def find_tree_by_point_cloud_tree_id(
+        self,
+        point_cloud_id: int,
+        tree_id: int,
+    ) -> Optional[Tree]:
+        """Find exact tree identity within a point cloud."""
+        result = await self.session.execute(
+            select(Tree)
+            .where(
+                and_(
+                    Tree.point_cloud_id == point_cloud_id,
+                    Tree.tree_id == tree_id,
+                )
+            )
+            .order_by(Tree.updated_at.desc(), Tree.id.desc())
+            .limit(1)
+        )
+        return result.scalars().first()
     
     async def upsert_tree(
         self,
@@ -94,8 +127,15 @@ class TreeRepository:
         Insert or update tree record.
         Uses location-based deduplication to avoid creating duplicate trees.
         """
-        # First check if a tree exists at this location
-        existing = await self.find_tree_by_location(longitude, latitude)
+        # First, use deterministic identity for idempotent retries.
+        existing = await self.find_tree_by_point_cloud_tree_id(point_cloud_id, tree_id)
+        if existing is None:
+            # Fallback to location-based dedup for cross-tile overlaps.
+            existing = await self.find_tree_by_location(
+                longitude,
+                latitude,
+                preferred_point_cloud_id=point_cloud_id,
+            )
         
         if existing:
             # Update existing tree with new data
