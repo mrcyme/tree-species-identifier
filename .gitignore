@@ -109,4 +109,4 @@ frontend/node_modules/
 *.pkl
 *.pickle
 checkpoints/
-models/
+models/model_202305171452_60
