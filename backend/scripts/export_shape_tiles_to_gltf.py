@@ -1,12 +1,16 @@
 """
-Export tree shape meshes from DB as direct 3D Tiles (1.1) with glTF content.
+Export tree shape meshes from DB as 3D Tiles 1.1 with batched glTF content.
 
 What this exporter does:
 - Reads trees with `shape_mesh` from the database.
 - Batches trees into XY tiles (meters) using WebMercator for indexing.
-- For each tile, creates one combined GLB mesh in local ENU coordinates.
-- Writes a valid 3D Tiles `tileset.json` that references each GLB directly.
-- Also writes debug metadata (`tiles_index.json` and per-tile JSON files).
+- For each tile, merges ALL trees into ONE GLB with per-tree feature IDs
+  and a shared columnar property table (EXT_mesh_features +
+  EXT_structural_metadata).
+- Writes a valid 3D Tiles `tileset.json` referencing one GLB per tile.
+- Clicking any tree in a 3D Tiles viewer (Cesium, deck.gl, …) resolves
+  per-tree metadata (species, height, crown diameter, …) via the glTF
+  extensions — no need for one file per tree.
 """
 import asyncio
 import json
@@ -109,11 +113,18 @@ def _append_aligned(bin_chunk: bytes, payload: bytes, alignment: int = 4) -> Tup
     return bin_chunk, offset
 
 
-def inject_feature_metadata_into_glb(glb_path: Path, tree_meta: Dict[str, Any]) -> None:
+def _inject_batched_features(
+    glb_path: Path,
+    feature_ids: np.ndarray,
+    tree_metadata_list: List[Dict[str, Any]],
+) -> None:
     """
-    Inject EXT_mesh_features + EXT_structural_metadata into a single-tree GLB.
-    This makes picked features expose per-tree metadata in viewers that rely on
-    glTF feature IDs and structural metadata.
+    Inject EXT_mesh_features + EXT_structural_metadata for N trees into a
+    single batched GLB.
+
+    ``feature_ids`` is a uint16 array (one entry per vertex) that maps each
+    vertex to its tree index.  ``tree_metadata_list`` holds one dict per tree
+    whose values are stored as columnar arrays in a glTF property table.
     """
     gltf, bin_chunk = _read_glb(glb_path)
 
@@ -121,136 +132,138 @@ def inject_feature_metadata_into_glb(glb_path: Path, tree_meta: Dict[str, Any]) 
     if not meshes:
         return
 
+    n_features = len(tree_metadata_list)
     accessors = gltf.setdefault("accessors", [])
     buffer_views = gltf.setdefault("bufferViews", [])
     buffers = gltf.setdefault("buffers", [{"byteLength": len(bin_chunk)}])
     if not buffers:
         buffers.append({"byteLength": len(bin_chunk)})
 
-    # Class schema from metadata types
+    # --- columnar property table ----------------------------------------
+    meta_keys = list(tree_metadata_list[0].keys())
     class_properties: Dict[str, Dict[str, Any]] = {}
-    property_table_properties: Dict[str, Dict[str, Any]] = {}
+    prop_table_props: Dict[str, Dict[str, Any]] = {}
 
-    def append_scalar_buffer(value: Any, key: str) -> None:
-        nonlocal bin_chunk
-        if isinstance(value, (int, np.integer)):
-            payload = struct.pack("<i", int(value))
-            component_type = "INT32"
-            alignment = 4
-        elif isinstance(value, (float, np.floating)):
-            payload = struct.pack("<d", float(value))
-            component_type = "FLOAT64"
-            alignment = 8
-        else:
-            text = str(value)
-            data = text.encode("utf-8")
-            offsets = struct.pack("<II", 0, len(data))
-            bin_chunk, values_off = _append_aligned(bin_chunk, data, alignment=1)
-            values_view = len(buffer_views)
+    for key in meta_keys:
+        values = [m[key] for m in tree_metadata_list]
+        first = values[0]
+
+        if isinstance(first, str):
+            encoded = [str(v).encode("utf-8") for v in values]
+            values_data = b"".join(encoded)
+            offsets: List[int] = []
+            pos = 0
+            for s in encoded:
+                offsets.append(pos)
+                pos += len(s)
+            offsets.append(pos)
+            offsets_data = struct.pack(f"<{len(offsets)}I", *offsets)
+
+            bin_chunk, val_off = _append_aligned(bin_chunk, values_data, 1)
+            val_view = len(buffer_views)
             buffer_views.append(
-                {
-                    "buffer": 0,
-                    "byteOffset": values_off,
-                    "byteLength": len(data),
-                }
+                {"buffer": 0, "byteOffset": val_off, "byteLength": len(values_data)}
             )
-            bin_chunk, offs_off = _append_aligned(bin_chunk, offsets, alignment=4)
+            bin_chunk, offs_off = _append_aligned(bin_chunk, offsets_data, 4)
             offs_view = len(buffer_views)
             buffer_views.append(
-                {
-                    "buffer": 0,
-                    "byteOffset": offs_off,
-                    "byteLength": len(offsets),
-                }
+                {"buffer": 0, "byteOffset": offs_off, "byteLength": len(offsets_data)}
             )
             class_properties[key] = {"type": "STRING"}
-            property_table_properties[key] = {
-                "values": values_view,
+            prop_table_props[key] = {
+                "values": val_view,
                 "stringOffsets": offs_view,
                 "stringOffsetType": "UINT32",
             }
-            return
 
-        bin_chunk, value_off = _append_aligned(bin_chunk, payload, alignment=alignment)
-        value_view = len(buffer_views)
-        buffer_views.append(
-            {
-                "buffer": 0,
-                "byteOffset": value_off,
-                "byteLength": len(payload),
-            }
-        )
-        class_properties[key] = {"type": "SCALAR", "componentType": component_type}
-        property_table_properties[key] = {"values": value_view}
+        elif isinstance(first, (int, np.integer)):
+            payload = struct.pack(f"<{n_features}i", *[int(v) for v in values])
+            bin_chunk, val_off = _append_aligned(bin_chunk, payload, 4)
+            val_view = len(buffer_views)
+            buffer_views.append(
+                {"buffer": 0, "byteOffset": val_off, "byteLength": len(payload)}
+            )
+            class_properties[key] = {"type": "SCALAR", "componentType": "INT32"}
+            prop_table_props[key] = {"values": val_view}
 
-    for k, v in tree_meta.items():
-        append_scalar_buffer(v, k)
+        else:
+            payload = struct.pack(f"<{n_features}d", *[float(v) for v in values])
+            bin_chunk, val_off = _append_aligned(bin_chunk, payload, 8)
+            val_view = len(buffer_views)
+            buffer_views.append(
+                {"buffer": 0, "byteOffset": val_off, "byteLength": len(payload)}
+            )
+            class_properties[key] = {"type": "SCALAR", "componentType": "FLOAT64"}
+            prop_table_props[key] = {"values": val_view}
 
-    # Add one feature-id attribute per primitive: all vertices -> feature 0
+    # --- per-primitive _FEATURE_ID_0 attribute ---------------------------
+    vertex_cursor = 0
     for mesh in meshes:
         for primitive in mesh.get("primitives", []):
             attrs = primitive.get("attributes") or {}
-            position_accessor_idx = attrs.get("POSITION")
-            if position_accessor_idx is None:
+            pos_idx = attrs.get("POSITION")
+            if pos_idx is None:
                 continue
 
-            vertex_count = int(accessors[position_accessor_idx]["count"])
-            feature_ids = np.zeros(vertex_count, dtype=np.uint16).tobytes()
-            bin_chunk, fid_off = _append_aligned(bin_chunk, feature_ids, alignment=2)
+            vertex_count = int(accessors[pos_idx]["count"])
+            prim_fids = feature_ids[vertex_cursor : vertex_cursor + vertex_count]
+            fid_bytes = prim_fids.astype(np.uint16).tobytes()
 
-            fid_view_idx = len(buffer_views)
+            bin_chunk, fid_off = _append_aligned(bin_chunk, fid_bytes, 2)
+            fid_view = len(buffer_views)
             buffer_views.append(
                 {
                     "buffer": 0,
                     "byteOffset": fid_off,
-                    "byteLength": len(feature_ids),
-                    "target": 34962,  # ARRAY_BUFFER
+                    "byteLength": len(fid_bytes),
+                    "target": 34962,
                 }
             )
 
-            fid_accessor_idx = len(accessors)
+            fid_acc = len(accessors)
             accessors.append(
                 {
-                    "bufferView": fid_view_idx,
+                    "bufferView": fid_view,
                     "byteOffset": 0,
-                    "componentType": 5123,  # UNSIGNED_SHORT
+                    "componentType": 5123,
                     "count": vertex_count,
                     "type": "SCALAR",
-                    "min": [0],
-                    "max": [0],
+                    "min": [int(prim_fids.min())],
+                    "max": [int(prim_fids.max())],
                 }
             )
 
-            attrs["_FEATURE_ID_0"] = fid_accessor_idx
+            attrs["_FEATURE_ID_0"] = fid_acc
             primitive["attributes"] = attrs
 
             prim_ext = primitive.setdefault("extensions", {})
             prim_ext["EXT_mesh_features"] = {
                 "featureIds": [
                     {
-                        "featureCount": 1,
+                        "featureCount": n_features,
                         "attribute": 0,
                         "propertyTable": 0,
                     }
                 ]
             }
 
+            vertex_cursor += vertex_count
+
+    # --- root-level structural metadata ----------------------------------
     top_ext = gltf.setdefault("extensions", {})
     top_ext["EXT_structural_metadata"] = {
         "schema": {
             "id": "tree_schema",
             "classes": {
-                "tree": {
-                    "properties": class_properties,
-                }
+                "tree": {"properties": class_properties},
             },
         },
         "propertyTables": [
             {
                 "name": "tree_properties",
                 "class": "tree",
-                "count": 1,
-                "properties": property_table_properties,
+                "count": n_features,
+                "properties": prop_table_props,
             }
         ],
     }
@@ -466,7 +479,12 @@ def export_tile(
     max_trees_per_tile: int = 5000,
 ) -> Dict[str, Any] | None:
     """
-    Export one logical tile as multiple per-tree GLBs + tree metadata entries.
+    Export one spatial tile as a single batched GLB.
+
+    All trees are merged into one mesh.  Each tree's vertices receive a
+    unique feature ID so that ``EXT_mesh_features`` /
+    ``EXT_structural_metadata`` make every tree individually clickable
+    in any 3D Tiles viewer.
     """
     if not trees:
         return None
@@ -474,10 +492,27 @@ def export_tile(
     if len(trees) > max_trees_per_tile:
         trees = trees[:max_trees_per_tile]
 
-    tree_entries: List[Dict[str, Any]] = []
-    tree_records: List[Dict[str, Any]] = []
-    tiles_dir = out_dir / "tiles"
-    tiles_dir.mkdir(parents=True, exist_ok=True)
+    # Tile origin = centroid of all trees in WGS-84.
+    lons = [float(t.longitude) for t in trees]
+    lats = [float(t.latitude) for t in trees]
+    alts = [tree_altitude_from_db(t) for t in trees]
+    avg_lon = sum(lons) / len(lons)
+    avg_lat = sum(lats) / len(lats)
+    avg_alt = sum(alts) / len(alts)
+    tile_origin = TileOrigin(
+        lon=avg_lon,
+        lat=avg_lat,
+        h=avg_alt,
+        ecef=geodetic_to_ecef(avg_lon, avg_lat, avg_alt),
+    )
+
+    # Accumulate per-tree geometry in tile-local ENU coordinates.
+    all_vertices: List[np.ndarray] = []
+    all_faces: List[np.ndarray] = []
+    all_colors: List[np.ndarray] = []
+    feature_id_per_vertex: List[int] = []
+    metadata_list: List[Dict[str, Any]] = []
+    vertex_offset = 0
 
     for t in trees:
         if not t.shape_mesh:
@@ -490,87 +525,84 @@ def export_tile(
         lon = float(t.longitude)
         lat = float(t.latitude)
         alt = tree_altitude_from_db(t)
-        origin = TileOrigin(lon=lon, lat=lat, h=alt, ecef=geodetic_to_ecef(lon, lat, alt))
 
-        # Keep mesh in local ENU, but store it in glTF Y-up so Cesium's
-        # runtime Y-up -> Z-up conversion restores correct world orientation.
-        glb_mesh = mesh.copy()
-        glb_mesh.apply_transform(z_up_to_y_up_transform())
+        # Translate tree mesh from its local frame into tile-local ENU.
+        tree_ecef = geodetic_to_ecef(lon, lat, alt)
+        tree_enu = ecef_to_enu(tree_ecef, tile_origin)
+        mesh.vertices = mesh.vertices + tree_enu
 
-        unique_tree_id = t.id if t.id is not None else t.tree_id
-        glb_name = f"tiles/tree_{unique_tree_id}_{key[0]}_{key[1]}.glb"
-        glb_path = out_dir / glb_name
-        glb_mesh.export(str(glb_path), file_type="glb")
+        feat_idx = len(metadata_list)
+        vc = mesh.visual.vertex_colors
+        if vc is None or len(vc) != len(mesh.vertices):
+            vc = np.tile(CANOPY_RGBA, (len(mesh.vertices), 1))
 
-        bounds = mesh.bounds
-        region = region_from_enu_bounds(bounds, origin)
-        transform = enu_to_ecef_transform(origin)
+        all_vertices.append(mesh.vertices)
+        all_faces.append(mesh.faces + vertex_offset)
+        all_colors.append(np.asarray(vc, dtype=np.uint8))
+        feature_id_per_vertex.extend([feat_idx] * len(mesh.vertices))
+        vertex_offset += len(mesh.vertices)
+
         db_id = int(t.id) if t.id is not None else int(t.tree_id)
         tree_id = int(t.tree_id) if t.tree_id is not None else db_id
-        species_name = t.species_name or "Unknown"
-        species_confidence = (
-            float(t.species_confidence) if t.species_confidence is not None else -1.0
-        )
-        height = float(t.height) if t.height is not None else 0.0
-        crown_diameter = float(t.crown_diameter) if t.crown_diameter is not None else 0.0
-
-        tree_entries.append(
-            {
-                "file": glb_name,
-                "region": region,
-                "transform": transform,
-                "metadata": {
-                    "db_id": db_id,
-                    "tree_id": tree_id,
-                    "species_name": species_name,
-                    "species_confidence": species_confidence,
-                    "height": height,
-                    "crown_diameter": crown_diameter,
-                    "longitude": lon,
-                    "latitude": lat,
-                    "altitude": alt,
-                },
-            }
-        )
-
-        # Make each single-tree GLB pickable with per-feature metadata.
-        inject_feature_metadata_into_glb(glb_path, tree_entries[-1]["metadata"])
-
-        tree_records.append(
+        metadata_list.append(
             {
                 "db_id": db_id,
                 "tree_id": tree_id,
+                "species_name": t.species_name or "Unknown",
+                "species_confidence": (
+                    float(t.species_confidence)
+                    if t.species_confidence is not None
+                    else -1.0
+                ),
+                "height": float(t.height) if t.height is not None else 0.0,
+                "crown_diameter": (
+                    float(t.crown_diameter) if t.crown_diameter is not None else 0.0
+                ),
                 "longitude": lon,
                 "latitude": lat,
                 "altitude": alt,
-                "species_name": species_name,
-                "species_confidence": species_confidence,
-                "height": height,
-                "crown_diameter": crown_diameter,
-                "n_vertices": len(mesh.vertices),
-                "n_faces": len(mesh.faces),
             }
         )
 
-    if not tree_entries:
+    if not metadata_list:
         return None
 
-    west = min(e["region"][0] for e in tree_entries)
-    south = min(e["region"][1] for e in tree_entries)
-    east = max(e["region"][2] for e in tree_entries)
-    north = max(e["region"][3] for e in tree_entries)
-    min_h = min(e["region"][4] for e in tree_entries)
-    max_h = max(e["region"][5] for e in tree_entries)
+    # Compute ENU bounding box *before* the Z-up → Y-up rotation.
+    combined_verts = np.concatenate(all_vertices)
+    enu_bounds = np.array([combined_verts.min(axis=0), combined_verts.max(axis=0)])
+
+    combined = trimesh.Trimesh(
+        vertices=combined_verts,
+        faces=np.concatenate(all_faces),
+        vertex_colors=np.concatenate(all_colors),
+        process=False,
+    )
+    combined.apply_transform(z_up_to_y_up_transform())
+
+    tiles_dir = out_dir / "tiles"
+    tiles_dir.mkdir(parents=True, exist_ok=True)
+    glb_name = f"tiles/tile_{key[0]}_{key[1]}.glb"
+    glb_path = out_dir / glb_name
+    combined.export(str(glb_path), file_type="glb")
+
+    feature_ids_arr = np.array(feature_id_per_vertex, dtype=np.uint16)
+    _inject_batched_features(glb_path, feature_ids_arr, metadata_list)
+
+    region = region_from_enu_bounds(enu_bounds, tile_origin)
+    transform = enu_to_ecef_transform(tile_origin)
 
     tile_meta = {
         "tile_id": f"{key[0]}_{key[1]}",
-        "region": [west, south, east, north, min_h, max_h],
-        "tree_count": len(tree_records),
-        "trees_as_tiles": tree_entries,
-        "trees": tree_records,
+        "glb_file": glb_name,
+        "region": region,
+        "transform": transform,
+        "tree_count": len(metadata_list),
+        "trees": metadata_list,
     }
 
-    with open(out_dir / f"tile_{key[0]}_{key[1]}_metadata.json", "w", encoding="utf-8") as f:
+    with open(
+        out_dir / f"tile_{key[0]}_{key[1]}_metadata.json", "w", encoding="utf-8"
+    ) as f:
         json.dump(tile_meta, f, indent=2)
 
     return tile_meta
@@ -586,7 +618,6 @@ async def export_tiles(
     if not trees:
         return {"tiles": [], "summary": {"trees_with_shapes": 0, "tile_count": 0}}
 
-    # Group by tile key
     grouped: Dict[Tuple[int, int], List[Tree]] = {}
     for t in trees:
         k = tile_key(float(t.longitude), float(t.latitude), tile_size_m)
@@ -594,32 +625,26 @@ async def export_tiles(
 
     tile_summaries: List[dict] = []
     for k, items in grouped.items():
-        info = export_tile(
-            items,
-            output_dir,
-            k,
-        )
+        info = export_tile(items, output_dir, k)
         if info:
             tile_summaries.append(info)
 
-    tree_entries: List[Dict[str, Any]] = []
-    for t in tile_summaries:
-        tree_entries.extend(t["trees_as_tiles"])
+    total_trees = sum(t["tree_count"] for t in tile_summaries)
 
-    # Global export index
     export_index = {
-        "format": "3d-tiles-1.1-gltf",
+        "format": "3d-tiles-1.1-batched-gltf",
         "crs": {"position": "EPSG:4326", "tile_indexing": "EPSG:3857"},
         "tile_size_m": tile_size_m,
         "vertical_mode": "db_direct",
         "summary": {
             "trees_with_shapes": len(trees),
             "tile_count": len(tile_summaries),
-            "tree_content_count": len(tree_entries),
+            "total_tree_features": total_trees,
         },
         "tiles": [
             {
                 "tile_id": t["tile_id"],
+                "glb_file": t["glb_file"],
                 "tree_count": t["tree_count"],
                 "region": t["region"],
             }
@@ -630,32 +655,24 @@ async def export_tiles(
     with open(output_dir / "tiles_index.json", "w", encoding="utf-8") as f:
         json.dump(export_index, f, indent=2)
 
-    # Generate direct 3D Tiles tileset (explicit tileset with glTF contents).
-    if tree_entries:
-        west = min(e["region"][0] for e in tree_entries)
-        south = min(e["region"][1] for e in tree_entries)
-        east = max(e["region"][2] for e in tree_entries)
-        north = max(e["region"][3] for e in tree_entries)
-        min_h = min(e["region"][4] for e in tree_entries)
-        max_h = max(e["region"][5] for e in tree_entries)
+    # One child per spatial tile (NOT per tree).
+    # Per-tree metadata lives inside each GLB via EXT_structural_metadata.
+    if tile_summaries:
+        west = min(t["region"][0] for t in tile_summaries)
+        south = min(t["region"][1] for t in tile_summaries)
+        east = max(t["region"][2] for t in tile_summaries)
+        north = max(t["region"][3] for t in tile_summaries)
+        min_h = min(t["region"][4] for t in tile_summaries)
+        max_h = max(t["region"][5] for t in tile_summaries)
 
         children = []
-        for e in tree_entries:
-            # Put per-tree metadata on the content object so pick/inspect flows
-            # can resolve metadata from the clicked GLB content directly.
-            content_with_metadata = {
-                "uri": e["file"],
-                "metadata": {
-                    "class": "tree",
-                    "properties": e["metadata"],
-                },
-            }
+        for t in tile_summaries:
             children.append(
                 {
-                    "boundingVolume": {"region": e["region"]},
+                    "boundingVolume": {"region": t["region"]},
                     "geometricError": 0.0,
-                    "transform": e["transform"],
-                    "content": content_with_metadata,
+                    "transform": t["transform"],
+                    "content": {"uri": t["glb_file"]},
                 }
             )
 
@@ -673,19 +690,35 @@ async def export_tiles(
                                 "type": "SCALAR",
                                 "componentType": "FLOAT64",
                             },
-                            "height": {"type": "SCALAR", "componentType": "FLOAT64"},
-                            "crown_diameter": {"type": "SCALAR", "componentType": "FLOAT64"},
-                            "longitude": {"type": "SCALAR", "componentType": "FLOAT64"},
-                            "latitude": {"type": "SCALAR", "componentType": "FLOAT64"},
-                            "altitude": {"type": "SCALAR", "componentType": "FLOAT64"},
+                            "height": {
+                                "type": "SCALAR",
+                                "componentType": "FLOAT64",
+                            },
+                            "crown_diameter": {
+                                "type": "SCALAR",
+                                "componentType": "FLOAT64",
+                            },
+                            "longitude": {
+                                "type": "SCALAR",
+                                "componentType": "FLOAT64",
+                            },
+                            "latitude": {
+                                "type": "SCALAR",
+                                "componentType": "FLOAT64",
+                            },
+                            "altitude": {
+                                "type": "SCALAR",
+                                "componentType": "FLOAT64",
+                            },
                         }
                     }
                 }
             },
             "geometricError": root_geometric_error,
             "root": {
-                "boundingVolume": {"region": [west, south, east, north, min_h, max_h]},
-                # Must be > 0 so runtime refines root and requests child content.
+                "boundingVolume": {
+                    "region": [west, south, east, north, min_h, max_h]
+                },
                 "geometricError": root_geometric_error,
                 "refine": "REPLACE",
                 "children": children,
@@ -702,7 +735,7 @@ async def main() -> None:
     import argparse
 
     parser = argparse.ArgumentParser(
-        description="Export DB shape meshes into direct 3D Tiles (1.1) with glTF content."
+        description="Export DB shape meshes as batched 3D Tiles 1.1 (one GLB per tile)."
     )
     parser.add_argument(
         "--output",
