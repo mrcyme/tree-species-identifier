@@ -98,11 +98,10 @@ def _run_predict_batch(
     Run DetailView prediction on a merged LAS and return results keyed by tree_id.
     """
     sys.path.insert(0, str(DETAILVIEW_DIR))
+    import inspect
     import torch
     from predict import run_predict
 
-    # Monkey-patch n_batch inside run_predict by temporarily modifying the
-    # source. Instead, we patch at the torch DataLoader level.
     _orig_dataloader = torch.utils.data.DataLoader
 
     class _PatchedDataLoader(_orig_dataloader):
@@ -113,7 +112,7 @@ def _run_predict_batch(
     torch.utils.data.DataLoader = _PatchedDataLoader
     try:
         with tempfile.TemporaryDirectory() as tmpdir:
-            _, _, joined_df, probs_df = run_predict(
+            predict_kwargs = dict(
                 prediction_data=str(merged_las),
                 path_las="",
                 model_path=str(model_path),
@@ -123,8 +122,10 @@ def _run_predict_batch(
                 path_csv_lookup=str(DETAILVIEW_DIR / "lookup.csv"),
                 projection_backend="numpy",
                 output_type="csv",
-                force_device="cuda" if torch.cuda.is_available() else "cpu",
             )
+            if "force_device" in inspect.signature(run_predict).parameters:
+                predict_kwargs["force_device"] = "cuda" if torch.cuda.is_available() else "cpu"
+            _, _, joined_df, probs_df = run_predict(**predict_kwargs)
     finally:
         torch.utils.data.DataLoader = _orig_dataloader
 
