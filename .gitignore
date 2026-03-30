@@ -5,102 +5,80 @@ __pycache__/
 *.so
 .Python
 build/
-develop-eggs/
 dist/
-downloads/
-eggs/
+site/
 .eggs/
-lib/
-lib64/
-parts/
-sdist/
-var/
-wheels/
-pip-wheel-metadata/
-share/python-wheels/
-*.egg-info/
-.installed.cfg
 *.egg
-MANIFEST
+*.egg-info/
+pip-wheel-metadata/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.hypothesis/
+.coverage
+.coverage.*
+htmlcov/
 
 # Virtual environments
+.venv/
 venv/
-ENV/
 env/
-.venv
+ENV/
 
-# IDE
+# Node / frontend
+node_modules/
+frontend/node_modules/
+frontend/dist/
+.pnpm-store/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# Editors / OS
 .vscode/
 .idea/
 *.swp
 *.swo
 *~
 .DS_Store
+Thumbs.db
 
-# Jupyter Notebook
-.ipynb_checkpoints
-
-# Environment variables
+# Local environment files
 .env
-.env.local
+.env.*
+!.env.example
+!.env.sample
+frontend/.env
+frontend/.env.*
+!frontend/.env.example
+!frontend/.env.sample
 
-# Data files (large files)
-*.pbf
-*.osm
+# Jupyter
+.ipynb_checkpoints/
+
+# Runtime output and local datasets
+/uploads/
+/output/
+/backend/output/
+/data/
+/models/
+/results/
+/debug/
+
+# Large geospatial / ML artifacts
+*.las
+*.laz
+*.e57
+*.ply
+*.pcd
 *.tif
 *.tiff
 *.geotiff
-*.las
-*.laz
-*.ply
-*.pcd
-*.e57
-*.obj
-*.fbx
 *.glb
 *.gltf
-*.ifc
-*.gpkg
-*.geojson
-*.csv
-*.parquet
-*.feather
-*.h5
-*.hdf5
-*.npz
-*.npy
-*.zip
-*.7z
-*.tar
-*.gz
-*.bz2
-data/
-data/raw/
-data/processed/
-results/
-
-# Logs
-*.log
-
-# OS
-.DS_Store
-Thumbs.db
-
-# Node (if used)
-node_modules/
-npm-debug.log
-yarn-error.log
-pnpm-debug.log*
-yarn-debug.log*
-
-# Directories with large/temporary files
-output/
-debug/
-uploads/
-.pnpm-store/
-frontend/node_modules/
-
-# ML / model artifacts
+*.obj
+*.fbx
 *.pt
 *.pth
 *.onnx
@@ -108,5 +86,22 @@ frontend/node_modules/
 *.joblib
 *.pkl
 *.pickle
-checkpoints/
-models/model_202305171452_60
+*.parquet
+*.feather
+*.h5
+*.hdf5
+*.npz
+*.npy
+
+# Archives and local database dumps
+*.zip
+*.7z
+*.tar
+*.gz
+*.bz2
+*.sqlite
+*.sqlite3
+*.db
+
+# Logs
+*.log

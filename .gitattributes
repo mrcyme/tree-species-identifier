@@ -1,0 +1,36 @@
+* text=auto eol=lf
+
+*.sh text eol=lf
+*.py text eol=lf
+*.R text eol=lf
+*.ts text eol=lf
+*.vue text eol=lf
+*.js text eol=lf
+*.json text eol=lf
+*.yml text eol=lf
+*.yaml text eol=lf
+*.md text eol=lf
+
+*.las binary
+*.laz binary
+*.e57 binary
+*.ply binary
+*.pcd binary
+*.tif binary
+*.tiff binary
+*.glb binary
+*.gltf binary
+*.obj binary
+*.fbx binary
+*.pt binary
+*.pth binary
+*.onnx binary
+*.ckpt binary
+*.zip binary
+*.7z binary
+*.tar binary
+*.gz binary
+*.bz2 binary
+*.png binary
+*.jpg binary
+*.jpeg binary
